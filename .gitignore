@@ -148,3 +148,6 @@ memory.db
 # User speech / run script temp files
 [0-9]*-player-script.js
 
+# Local OCI launch script
+retry-create-vm.ps1
+
