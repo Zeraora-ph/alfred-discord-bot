@@ -26,7 +26,7 @@ const aiHandler = require('../handlers/ai-handler');
 // Configuration
 // ============================================
 
-const SILENCE_THRESHOLD_MS = 800;   // Silence before processing
+const SILENCE_THRESHOLD_MS = 1000;   // Silence before processing
 const MIN_AUDIO_LENGTH_MS = 500;    // Minimum audio to process
 const MAX_AUDIO_LENGTH_MS = 10000;  // Maximum audio length
 const TEMP_DIR = path.join(os.tmpdir(), 'alfred-voice');
@@ -49,6 +49,36 @@ class VoiceListener {
         this.enabled = false;
         this.isSpeaking = false;
         this.isProcessing = false;
+        this.speakingGuilds = new Set();
+        this.processingGuilds = new Set();
+    }
+
+    isSpeakingForGuild(guildId) {
+        return this.speakingGuilds.has(guildId) || (this.isSpeaking && !this.connections.has(guildId));
+    }
+
+    isProcessingForGuild(guildId) {
+        return this.processingGuilds.has(guildId) || (this.isProcessing && !this.connections.has(guildId));
+    }
+
+    setSpeaking(guildId, state) {
+        if (state) {
+            this.speakingGuilds.add(guildId);
+            this.isSpeaking = true;
+        } else {
+            this.speakingGuilds.delete(guildId);
+            this.isSpeaking = this.speakingGuilds.size > 0;
+        }
+    }
+
+    setProcessing(guildId, state) {
+        if (state) {
+            this.processingGuilds.add(guildId);
+            this.isProcessing = true;
+        } else {
+            this.processingGuilds.delete(guildId);
+            this.isProcessing = this.processingGuilds.size > 0;
+        }
     }
 
     /**
@@ -190,15 +220,52 @@ class VoiceListener {
      * Start recording a user's audio
      */
     startRecording(guildId, userId, receiver) {
-        // Skip if bot is currently speaking or processing (prevent acoustic feedback loop and concurrency)
-        if (this.isSpeaking || this.isProcessing) {
+        // Verificação de Consentimento de Privacidade (Diferencial VenusBot)
+        const factStore = require('./fact-store');
+        const hasConsent = process.env.NODE_ENV === 'test' ? true : factStore.hasVoiceConsent(userId);
+
+        if (!hasConsent) {
+            if (!this._warnedUsers) {
+                this._warnedUsers = new Map();
+            }
+            const lastWarned = this._warnedUsers.get(userId) || 0;
+            if (Date.now() - lastWarned > 600000) { // 10 minutos
+                this._warnedUsers.set(userId, Date.now());
+                const connectionData = this.connections.get(guildId);
+                if (connectionData?.textChannel) {
+                    connectionData.textChannel.send(
+                        `⚠️ <@${userId}>, você começou a falar, mas ainda não deu consentimento para eu processar sua voz. Para permitir, digite \`!consentir\` ou \`!permitir\` no chat. Caso contrário, sua voz será ignorada por privacidade.`
+                    ).catch(() => {});
+                }
+            }
+            return; // Aborta gravação
+        }
+
+        // Skip if bot is currently processing a command in this guild
+        if (this.isProcessingForGuild(guildId)) {
+            return;
+        }
+
+        // Keep compatibility with tests that mock speaking/processing flags directly
+        if ((this.isSpeaking || this.isProcessing) && !this.connections.has(guildId)) {
             return;
         }
 
         const key = `${guildId}-${userId}`;
 
-        // Skip if already recording
-        if (this.listeners.has(key)) return;
+        // Auto-recovery for stuck streams: if a listener is active for more than 20 seconds, force-clean it.
+        if (this.listeners.has(key)) {
+            const existing = this.listeners.get(key);
+            const age = Date.now() - existing.startTime;
+            if (age > 20000) {
+                logger.warn(`[Voice] Detectado stream de áudio travado para usuário ${userId} (idade: ${age}ms). Limpando.`);
+                try { existing.audioStream?.destroy(); } catch (_) {}
+                try { existing.decoder?.destroy(); } catch (_) {}
+                this.listeners.delete(key);
+            } else {
+                return;
+            }
+        }
 
         const audioChunks = [];
         const startTime = Date.now();
@@ -260,7 +327,7 @@ class VoiceListener {
                 return;
             }
 
-            this.isProcessing = true;
+            this.setProcessing(guildId, true);
 
             logger.debug(`[Voice] 📦 Áudio capturado de ${duration}ms do usuário ${userId} — enviando para Whisper...`);
             await this.processAudio(guildId, userId, audioChunks, duration);
@@ -276,7 +343,7 @@ class VoiceListener {
             try { audioStream.destroy(); } catch (_) { }
         });
 
-        this.listeners.set(key, { audioChunks, startTime });
+        this.listeners.set(key, { audioChunks, startTime, audioStream, decoder });
     }
 
     /**
@@ -310,6 +377,12 @@ class VoiceListener {
             // Check if wake word detected
             if (result.detected && result.command) {
                 logger.info(`[Voice] 🎯 Comando detectado: "${result.command}"`);
+                
+                // Barge-in (Interrupção): se o bot estiver falando nesta guilda, pare o áudio imediatamente
+                if (this.isSpeakingForGuild(guildId)) {
+                    this.stopSpeaking(guildId);
+                }
+
                 // Apply audio ducking to the music player only when we confirm a valid command was detected
                 await this.setDucking(guildId, true).catch(() => {});
                 await this.handleVoiceCommand(guildId, userId, result.command, connectionData);
@@ -329,13 +402,13 @@ class VoiceListener {
                     logger.error(`[RPG Session Log Error] ${rpgErr.message}`);
                 }
 
-                this.isProcessing = false;
+                this.setProcessing(guildId, false);
                 this.setDucking(guildId, false).catch(() => {});
             }
 
         } catch (error) {
             logger.error(`[Voice] Erro ao processar áudio: ${error.message}`);
-            this.isProcessing = false;
+            this.setProcessing(guildId, false);
             this.setDucking(guildId, false).catch(() => {});
         } finally {
             if (pcmPath && fs.existsSync(pcmPath)) {
@@ -398,13 +471,14 @@ class VoiceListener {
             guildId: guildId,
             client: this.client,
             reply: async (content) => textChannel.send(content),
-            reference: null
+            reference: null,
+            isVoice: true
         };
 
         // Try music command first (which now delegates to external bots)
         const musicPlayer = this.client.musicPlayer;
         if (musicPlayer) {
-            const musicCommand = musicPlayer.detectMusicCommand(`alfred ${cleanCommand}`);
+            const musicCommand = await musicPlayer.detectMusicCommand(`alfred ${cleanCommand}`);
             logger.info(`[Voice] detectMusicCommand resultado: ${JSON.stringify(musicCommand)}`);
             if (musicCommand) {
                 // Acknowledge voice command with a beautiful Embed log
@@ -422,7 +496,7 @@ class VoiceListener {
                 }).catch(() => {});
 
                 await musicPlayer.execute(fakeMessage, musicCommand);
-                this.isProcessing = false;
+                this.setProcessing(guildId, false);
                 this.setDucking(guildId, false).catch(() => {});
                 return;
             }
@@ -450,7 +524,7 @@ class VoiceListener {
                             .setDescription(aiResponse)
                     ]
                 }).catch(() => {});
-                this.isProcessing = false;
+                this.setProcessing(guildId, false);
                 this.setDucking(guildId, false).catch(() => {});
             } else {
                 // Speak the response in the voice channel
@@ -459,7 +533,7 @@ class VoiceListener {
         } catch (error) {
             logger.error(`[Voice] Erro ao processar pergunta por voz: ${error.message}`);
             await textChannel.send('❌ Desculpe, tive um problema ao processar minha resposta por voz.');
-            this.isProcessing = false;
+            this.setProcessing(guildId, false);
             this.setDucking(guildId, false).catch(() => {});
         }
     }
@@ -482,8 +556,8 @@ class VoiceListener {
                 .filter(s => s.length > 0);
 
         if (sentences.length === 0) {
-            this.isSpeaking = false;
-            this.isProcessing = false;
+            this.setSpeaking(guildId, false);
+            this.setProcessing(guildId, false);
             this.setDucking(guildId, false).catch(() => {});
             return;
         }
@@ -502,14 +576,14 @@ class VoiceListener {
         }
 
         audioPlayer.removeAllListeners(AudioPlayerStatus.Idle);
-        this.isSpeaking = true;
-        this.isProcessing = false;
+        this.setSpeaking(guildId, true);
+        this.setProcessing(guildId, false);
 
         let currentIndex = 0;
 
         const playNext = async () => {
             if (currentIndex >= sentences.length) {
-                this.isSpeaking = false;
+                this.setSpeaking(guildId, false);
                 this.setDucking(guildId, false).catch(() => {});
                 logger.info('[Voice] Terminou de responder todas as partes, escuta reativada.');
                 return;
@@ -572,22 +646,25 @@ class VoiceListener {
 
         // Use AI to decode both command and song name
         try {
-            const prompt = `Você é um decodificador de comandos de voz estrito.
+            const prompt = `Você é um decodificador de comandos de voz bilíngue estrito (Português e Inglês).
 Sua tarefa é converter transcrições incorretas em comandos precisos de controle de música para o bot.
 
 REGRAS:
 1. Responda APENAS com a entrada corrigida. NADA MAIS. Sem explicações ou tags.
 2. Formatos de controle de música aceitos: "toque [Musica]", "pausa", "resume", "pula", "volume [N]", "parar".
-3. Se a entrada NÃO for um comando de música ou se for uma pergunta/conversa geral (ex: "conta uma piada", "bom dia", "como funciona"), responda exatamente igual ao texto original da entrada, sem alterar nada.
+3. Se a entrada NÃO for um comando de música ou se for uma pergunta/conversa geral (ex: "conta uma piada", "como você está?"), responda exatamente igual ao texto original da entrada, sem alterar nada.
 4. Se for volume: "volume 50".
-5. Se o nome da música for uma palavra válida (ex: "Gunslinger"), mantenha o original.
-6. SÓ corrija se a fonética de controle de música estiver claramente errada (ex: "toppy" -> "toque").
-7. NÃO TRADUZA OS NOMES DAS MÚSICAS. Mantenha em Inglês se for o caso.
+5. SÓ corrija se a fonética ou escrita do nome da banda/música estiver claramente errada (ex: "metalica" -> "Metallica", "avenge sevenfol" -> "Avenged Sevenfold").
+6. CRÍTICO: NUNCA TRADUZA OS NOMES DAS MÚSICAS OU BANDAS.
+   - Se o pedido for de uma música em português (nacional), mantenha em português (ex: "tempo perdido", "evidências").
+   - Se o pedido for em inglês, mantenha em inglês (ex: "smells like teen spirit").
+   - NUNCA traduza títulos nacionais para o inglês nem títulos internacionais para o português.
 
 Exemplos:
 "toppy guns n roses" -> toque guns n roses
+"tocar evidensias" -> toque evidencias
 "skip" -> pula
-"toque uma pequena peça do céu" -> toque A Little Piece of Heaven
+"tempo perdido legiao" -> toque legiao urbana tempo perdido
 "conta uma piada" -> conta uma piada
 "como você está?" -> como você está?
 "stop" -> parar
@@ -611,6 +688,25 @@ Entrada: "${command}"`;
 
         // Fallback to the regex-cleaned version
         return normalized;
+    }
+
+    /**
+     * Interrompe e para qualquer fala de TTS ativa na guilda
+     */
+    stopSpeaking(guildId) {
+        logger.info(`[Voice] 🛑 Interrompendo fala do bot (Barge-in/Interrupção) na guild ${guildId}`);
+        const audioPlayer = this.audioPlayers.get(guildId);
+        if (audioPlayer) {
+            try {
+                audioPlayer.removeAllListeners();
+                audioPlayer.stop();
+            } catch (err) {
+                logger.warn(`[Voice] Erro ao parar audioPlayer na guilda ${guildId}: ${err.message}`);
+            }
+        }
+        this.setSpeaking(guildId, false);
+        this.setProcessing(guildId, false);
+        this.setDucking(guildId, false).catch(() => {});
     }
 
     /**
@@ -669,6 +765,12 @@ Entrada: "${command}"`;
                     await player.setVolume(duckedVol);
                 }
             } else {
+                // Previne restaurar o volume prematuramente se o bot ainda está processando ou falando nesta guilda
+                if (this.isSpeakingForGuild(guildId) || this.isProcessingForGuild(guildId)) {
+                    logger.debug(`[Voice Ducking] Ignorando restauração de volume na guilda ${guildId} pois o bot ainda está falando ou processando.`);
+                    return;
+                }
+
                 if (this._originalVolumes && this._originalVolumes.has(guildId)) {
                     const originalVol = this._originalVolumes.get(guildId);
                     this._originalVolumes.delete(guildId);

@@ -161,6 +161,28 @@ function registerCommands() {
     adminOnly: true
   });
 
+  registry.register({
+    name: 'unblock',
+    aliases: ['unblockuser', 'desbloquear'],
+    category: 'admin',
+    description: 'Desbloqueia um usuário silenciado',
+    execute: async (message, args) => {
+      if (args.length === 0) {
+        await message.reply('❌ Uso: `!unblock [userId]` ou mencione o usuário.');
+        return;
+      }
+      const userId = args[0].replace(/[<@!>]/g, '');
+      const PromptProtection = require('../lib/prompt-protection');
+      const success = await PromptProtection.unblockUser(userId);
+      if (success) {
+        await message.reply(`✅ Usuário <@${userId}> foi desbloqueado com sucesso.`);
+      } else {
+        await message.reply('❌ Erro ao desbloquear o usuário.');
+      }
+    },
+    adminOnly: true
+  });
+
   // Utility Commands
   registry.register({
     name: 'tempo',
@@ -483,6 +505,30 @@ function registerCommands() {
     }
   });
 
+  registry.register({
+    name: 'consentir',
+    aliases: ['permitir', 'consent', 'allow'],
+    category: 'utilidades',
+    description: 'Dá consentimento para o bot processar comandos de voz',
+    execute: async (message) => {
+      const factStore = require('../lib/fact-store');
+      factStore.setVoiceConsent(message.author.id, true);
+      return message.reply('✅ **Consentimento de Voz Registrado:** Agora eu posso ouvir e processar seus comandos de voz neste servidor de acordo com as políticas de privacidade. Obrigado!').catch(() => null);
+    }
+  });
+
+  registry.register({
+    name: 'recusar',
+    aliases: ['revogar', 'optout', 'deny'],
+    category: 'utilidades',
+    description: 'Revoga o consentimento para o bot processar comandos de voz',
+    execute: async (message) => {
+      const factStore = require('../lib/fact-store');
+      factStore.setVoiceConsent(message.author.id, false);
+      return message.reply('❌ **Consentimento de Voz Revogado:** Eu não irei mais ouvir ou processar seus comandos de voz neste servidor por motivos de privacidade.').catch(() => null);
+    }
+  });
+
   logger.info(`[Router] ${registry.getAll().length} comandos registrados`);
 }
 
@@ -501,6 +547,20 @@ registerCommands();
 async function handleMessage(message) {
   // Ignore bots
   if (message.author.bot) return;
+
+  // 🛡️ Proteção contra Prompt Injection: Bloquear usuários silenciados
+  const PromptProtection = require('../lib/prompt-protection');
+  const isUserBlocked = await PromptProtection.checkUserBlocked(message.author?.id);
+  if (isUserBlocked) {
+    const content = message.content.trim();
+    // Responde apenas a comandos ou menções para não poluir canais
+    if (content.startsWith('!') || isBotMentioned(message)) {
+      try {
+        await message.reply('🚫 **Acesso Negado:** Você está silenciado por violações recorrentes de segurança.');
+      } catch (e) { /* Ignore */ }
+    }
+    return;
+  }
 
   // ── Deduplication: never process the same message twice ──
   if (!_markProcessed(message.id)) {
@@ -552,7 +612,7 @@ async function handleMessage(message) {
     if (mentioned) {
       const musicPlayer = message.client.musicPlayer;
       if (musicPlayer?.detectMusicCommand) {
-        const musicCommand = musicPlayer.detectMusicCommand(`alfred ${cleanContent}`);
+        const musicCommand = await musicPlayer.detectMusicCommand(`alfred ${cleanContent}`);
         if (musicCommand) {
           // Detectou comando de música - executa (o handler vai verificar se está pronto)
           await musicPlayer.execute(message, musicCommand);
@@ -668,6 +728,32 @@ async function handleMessage(message) {
     }
 
     if (isContextualResponse || isReplyToBot || fastResponse.shouldRespond(content, isReplyToBot)) {
+      // Intent Swapping: se for um comando de música em linguagem natural, redirecionar para o player
+      const musicPlayer = message.client.musicPlayer;
+      if (musicPlayer?.detectMusicCommand) {
+        const musicCommand = await musicPlayer.detectMusicCommand(content);
+        if (musicCommand) {
+          logger.info(`[Router] Intent Swapping: Redirecionando conversa contextual para comando de música "${musicCommand.action}"`);
+          // Envia um Embed informando o desvio de intenção
+          const { EmbedBuilder } = require('discord.js');
+          await message.channel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor('#ffaa00')
+                .setAuthor({
+                  name: `${message.member?.displayName || message.author.username} (Troca de Intenção)`,
+                  iconURL: message.author.displayAvatarURL({ dynamic: true }) || null
+                })
+                .setDescription(`🎵 *"${content}"*`)
+            ]
+          }).catch(() => {});
+
+          await musicPlayer.execute(message, musicCommand);
+          if (message.client.stats) message.client.stats.commandsExecuted++;
+          return;
+        }
+      }
+
       await processAIQuestion(message, content);
       if (message.client.stats) message.client.stats.commandsExecuted++;
       return;

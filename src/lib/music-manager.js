@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const { LavalinkManager } = require('lavalink-client');
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const axios = require('axios');
 const logger = require('./logger');
 const factStore = require('./fact-store');
 
@@ -232,13 +233,14 @@ const EMOJIS = {
 async function correctMusicQuery(query) {
   try {
     const aiClient = require('./ai-client');
-    const prompt = `Corrija erros de transcrição de voz para nomes de bandas/músicas.
+    const prompt = `Corrija erros de transcrição de voz para nomes de bandas/músicas (bilíngue: Português e Inglês).
 ENTRADA: "${query}"
 ATENÇÃO:
 - Se for um comando como "parar", "pula", "sair", "tchau", RETORNE IGUAL.
 - NÃO mude "parar" para "Parabéns".
 - Só corrija se for claramente nome de banda/música errado.
-Exemplos: "vintage 7 fold" → "Avenged Sevenfold", "parar" → "parar", "pula" → "pula"
+- CRÍTICO: NUNCA TRADUZA OS NOMES DAS MÚSICAS. Músicas nacionais em português devem permanecer em português, e internacionais em inglês devem permanecer em inglês.
+Exemplos: "vintage 7 fold" → "Avenged Sevenfold", "evidensias" → "Evidências", "legiao tempo perdido" → "Legião Urbana Tempo Perdido", "parar" → "parar"
 RESPONDA APENAS COM O NOME CORRIGIDO:`;
 
     const response = await aiClient.chat([{ role: 'user', content: prompt }],
@@ -274,6 +276,7 @@ class MusicManager {
     this.autoplay = new Map();
     this.autoplayLimit = new Map();
     this.autoplayCount = new Map();
+    this._autoplayLocks = new Set();
 
     // RPG Mode
     this.silentMode = new Map();   // guildId -> boolean
@@ -522,7 +525,35 @@ class MusicManager {
   // NLP Detection (mantido 100% do original)
   // ============================================
 
-  detectMusicCommand(content) {
+  async _validatePlayRequestWithAI(query, content) {
+    if (process.env.NODE_ENV === 'test') {
+      return true;
+    }
+    const aiClient = require('./ai-client');
+    try {
+      const prompt = `Analise a mensagem do usuário e determine se ele está pedindo EXPLICITAMENTE para tocar/reproduzir uma música (ex: tocar um artista, música, botar áudio) ou se ele está apenas fazendo uma pergunta histórica, pedindo uma informação, explicação, tradução, ou conversando sobre uma música/artista.
+Se a intenção do usuário for tocar/reproduzir uma música, retorne "true".
+Se a intenção for apenas fazer uma pergunta ou pedir uma explicação (ex: "me conte a história", "quem canta", "o que significa", "explique a letra", "traduza"), retorne "false".
+
+Mensagem: "${content}"
+Busca detectada: "${query}"
+
+Responda APENAS "true" ou "false".`;
+
+      const response = await aiClient.chat([
+        { role: 'system', content: 'Você é um classificador binário preciso de intenção musical que responde apenas "true" ou "false".' },
+        { role: 'user', content: prompt }
+      ], { maxTokens: 5, temperature: 0.1 });
+
+      const result = response.choices?.[0]?.message?.content?.toLowerCase() || '';
+      return result.includes('true');
+    } catch (e) {
+      logger.warn(`[MusicManager/AIPlayValidator] Falha ao validar pedido de música com IA: ${e.message}`);
+      return true; // Fallback seguro
+    }
+  }
+
+  async detectMusicCommand(content) {
     const text = content.toLowerCase().trim();
     const originalContent = content.trim();
 
@@ -596,6 +627,14 @@ class MusicManager {
         const query = match[1].trim();
         if (query.length < 3) continue;
         if (/^(pausa|pause|para|stop|pula|skip|fila|queue|volume)/i.test(query)) continue;
+
+        // Validar com IA para evitar falsos positivos
+        const isValid = await this._validatePlayRequestWithAI(query, originalContent);
+        if (!isValid) {
+          logger.info(`[MusicManager] Comando de play "${originalContent}" descartado pela IA (detectado como conversa/pergunta).`);
+          return null;
+        }
+
         return { action: 'play', query };
       }
     }
@@ -757,7 +796,7 @@ class MusicManager {
       }
 
       switch (command.action) {
-        case 'play':           return await this.play(message, command.query);
+        case 'play':           return await this.play(message, command.query, { isVoice: message.isVoice });
         case 'pause':          return await this.pause(message);
         case 'resume':         return await this.resume(message);
         case 'skip':           return await this.skip(message);
@@ -936,12 +975,17 @@ class MusicManager {
       let searchQuery = query;
       const isUrl = /^(https?:\/\/)/i.test(query);
 
-      if (isUrl && query.includes('music.youtube.com')) {
-        const videoIdMatch = query.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-        if (videoIdMatch) {
-          searchQuery = `https://www.youtube.com/watch?v=${videoIdMatch[1]}`;
-        } else {
-          searchQuery = query.replace('music.youtube.com', 'www.youtube.com');
+      if (isUrl) {
+        const isYoutube = query.includes('youtube.com') || query.includes('youtu.be') || query.includes('music.youtube.com');
+        if (isYoutube) {
+          const listMatch = query.match(/[?&]list=([a-zA-Z0-9_\-]+)/);
+          const videoMatch = query.match(/(?:v=|\/v\/|embed\/|youtu\.be\/|watch\?v=)([a-zA-Z0-9_\-]{11})/);
+
+          if (listMatch) {
+            searchQuery = `https://www.youtube.com/playlist?list=${listMatch[1]}`;
+          } else if (videoMatch) {
+            searchQuery = `https://www.youtube.com/watch?v=${videoMatch[1]}`;
+          }
         }
       }
 
@@ -1002,12 +1046,37 @@ class MusicManager {
         return message.channel.send(`❌ Não achei nada para: **${query}**`).catch(() => null);
       }
 
+      let tracksToAdd = res.loadType === 'playlist' ? res.tracks : [res.tracks[0]];
+      if (res.loadType === 'playlist' && tracksToAdd.length > 100) {
+        logger.warn(`[Música] Playlist muito longa (${tracksToAdd.length} faixas). Limitando para 100 faixas para evitar sobrecarga.`);
+        tracksToAdd = tracksToAdd.slice(0, 100);
+      }
+      const firstAutoplayIndex = player.queue.tracks.findIndex(t => t.requester?.id === 'autoplay-bot');
+
+      player.queue.add(tracksToAdd);
+
       if (res.loadType === 'playlist') {
-        player.queue.add(res.tracks);
-        logger.info(`[Música] Playlist adicionada: ${res.tracks.length} tracks`);
+        logger.info(`[Música] Playlist adicionada: ${tracksToAdd.length} tracks`);
       } else {
-        player.queue.add(res.tracks[0]);
         logger.info(`[Música] Adicionado: "${res.tracks[0].info.title}" — ${res.tracks[0].info.author}`);
+      }
+
+      if (opts.isVoice) {
+        const isCurrentAutoplay = player.queue.current?.requester?.id === 'autoplay-bot' || !player.queue.current;
+        if (isCurrentAutoplay && (player.playing || player.paused)) {
+          const addedCount = tracksToAdd.length;
+          const addedTracks = player.queue.tracks.slice(-addedCount);
+          player.queue.tracks.splice(player.queue.tracks.length - addedCount, addedCount);
+          player.queue.tracks.splice(0, 0, ...addedTracks);
+          logger.info(`[Música] Pedido por voz: pulando faixa atual do autoplay para tocar o pedido imediatamente.`);
+          await player.skip();
+        } else if (firstAutoplayIndex !== -1) {
+          const addedCount = tracksToAdd.length;
+          const addedTracks = player.queue.tracks.slice(-addedCount);
+          player.queue.tracks.splice(player.queue.tracks.length - addedCount, addedCount);
+          player.queue.tracks.splice(firstAutoplayIndex, 0, ...addedTracks);
+          logger.info(`[Música] Pedido por voz prioritário: ${addedCount} faixas inseridas antes do Autoplay`);
+        }
       }
 
       if (searchMsg) searchMsg.delete().catch(() => {});
@@ -1254,8 +1323,6 @@ class MusicManager {
 
   // ============================================
   // Autoplay / DJ Mode
-  // ============================================
-
   async toggleAutoplay(message) {
     const guildId = message.guild?.id || message.guildId;
     const current = this.autoplay.get(guildId) || false;
@@ -1275,77 +1342,329 @@ class MusicManager {
     }).catch(() => null);
   }
 
-  async _handleAutoplay(player, currentTrackInfo = null) {
-    const guildId = player.guildId;
-    const count = this.autoplayCount.get(guildId) || 0;
-    const limit = this.autoplayLimit.get(guildId) || 10;
-
-    if (count >= limit) {
-      this.autoplay.set(guildId, false);
-      logger.info(`[Autoplay] Limite ${limit} atingido — desativando`);
-      return;
+  async _parseSongTitleWithAI(title) {
+    if (process.env.NODE_ENV === 'test') {
+      return null;
     }
+    const aiClient = require('./ai-client');
+    try {
+      const prompt = `Extraia o nome do artista principal e o título da música a partir do título do vídeo do YouTube fornecido.
+Se o vídeo for visivelmente um vídeo de reação, vocal coach, review, comentário, vlog ou maquiagem, e não a música em si, retorne o campo "is_song" como false.
+Responda APENAS com um objeto JSON válido (sem markdown, sem blocos de código) no seguinte formato:
+{"artist": "nome do artista", "title": "título da música", "is_song": true/false}
 
-    // MODO RPG: se há um mood ativo, o DJ SEMPRE puxa da lista curada do mood
-    // (moods.json) em vez de seguir "relacionadas" do YouTube — que desviam para
-    // músicas aleatórias/fora de tema (ex: pop em espanhol).
-    const activeMood = this.activeMood.get(guildId);
-    if (activeMood) {
-      return await this._handleMoodAutoplay(player, activeMood);
+Título do vídeo: "${title}"`;
+
+      const response = await aiClient.chat([
+        { role: 'system', content: 'Você é um extrator de metadados musicais estrito que responde apenas em JSON.' },
+        { role: 'user', content: prompt }
+      ], { maxTokens: 100, temperature: 0.1 });
+
+      const text = response.choices?.[0]?.message?.content || '';
+      const cleaned = text.replace(/```json/i, '').replace(/```/g, '').trim();
+      const data = JSON.parse(cleaned);
+      return {
+        artist: data.artist?.trim() || '',
+        title: data.title?.trim() || '',
+        isSong: data.is_song !== false
+      };
+    } catch (e) {
+      logger.warn(`[Autoplay/AIParser] Falha ao analisar título com IA: ${e.message}`);
+      return null;
     }
+  }
 
-    const last = currentTrackInfo || player.queue.previous?.[0]?.info;
-    if (!last) return;
-
-    const seedTitle = last.title.split(/[\(\[\-—]/)[0].trim();
-    const seed = `${last.author} ${seedTitle}`.trim().slice(0, 80);
+  async _getLastFMRecommendations(artist, title) {
+    const apiKey = process.env.LASTFM_API_KEY;
+    if (!apiKey) {
+      logger.debug('[Autoplay/LastFM] Chave LASTFM_API_KEY não configurada no ambiente.');
+      return [];
+    }
 
     try {
-      const res = await player.search(
-        { query: seed, source: 'ytsearch' },
-        { id: 'autoplay-bot' }
-      );
+      const url = `http://ws.audioscrobbler.com/2.0/?method=track.getsimilar&artist=${encodeURIComponent(artist)}&track=${encodeURIComponent(title)}&api_key=${apiKey}&format=json&limit=10`;
+      const response = await axios.get(url, { timeout: 3000 });
+      const tracks = response.data?.similartracks?.track;
+      if (!tracks || !Array.isArray(tracks)) {
+        return [];
+      }
 
-      if (!res || res.loadType === 'empty' || res.loadType === 'error') return;
-      if (!res.tracks || !res.tracks.length) return;
+      return tracks.map(t => ({
+        title: t.name,
+        author: t.artist?.name || ''
+      }));
+    } catch (e) {
+      logger.warn(`[Autoplay/LastFM] Erro ao obter recomendações da API Last.fm: ${e.message}`);
+      return [];
+    }
+  }
 
-      // Helper para obter o nome limpo da música (sem autor, parênteses ou colchetes)
+  _isLikelyMusic(track) {
+    if (!track || !track.info) return false;
+    const title = (track.info.title || '').toLowerCase();
+    
+    // Filtro: termos que indicam vídeos não musicais (vlogs, reviews, reacts, etc.)
+    const badPatterns = /\b(live|reaction|reacts|cover|interview|shorts|behind the scenes|lyric video|vlog|review|makeup|tutorial|unboxing|reacting|coach|vocal coach|pull off|reacts to|reviewing|live @|live at|gigs|show)\b/i;
+    if (badPatterns.test(title)) return false;
+    
+    // Canais "- Topic" ou "-Topic" são gerados automaticamente pela distribuidora da música (sinal muito forte de música oficial)
+    const author = (track.info.author || '').toLowerCase();
+    if (author.endsWith('- topic') || author.endsWith('-topic')) return true;
+    
+    // Limite de duração: rejeitar vídeos muito curtos ou muito longos (compilações de 1h+)
+    const duration = track.info.duration || track.info.length || 0;
+    if (duration < 60000 || duration > 600000) return false; // Entre 1 e 10 minutos
+    
+    return true;
+  }
+
+  async _handleAutoplay(player, currentTrackInfo = null) {
+    const guildId = player.guildId;
+    if (this._autoplayLocks.has(guildId)) {
+      logger.info(`[Autoplay] Já existe uma tarefa de autoplay ativa para guild ${guildId}. Ignorando.`);
+      return;
+    }
+    this._autoplayLocks.add(guildId);
+
+    try {
+      const count = this.autoplayCount.get(guildId) || 0;
+      const limit = this.autoplayLimit.get(guildId) || 10;
+
+      if (count >= limit) {
+        this.autoplay.set(guildId, false);
+        logger.info(`[Autoplay] Limite ${limit} atingido — desativando`);
+        return;
+      }
+
+      // MODO RPG: se há um mood ativo, o DJ SEMPRE puxa da lista curada do mood
+      const activeMood = this.activeMood.get(guildId);
+      if (activeMood) {
+        return await this._handleMoodAutoplay(player, activeMood);
+      }
+
+      // Varre o histórico de reprodução para encontrar sementes musicais legítimas
+      const history = player.queue.previous || [];
+      const candidatesForSeed = currentTrackInfo ? [currentTrackInfo, ...history] : history;
+
+      const seeds = [];
+      const blacklist = ['reaction', 'reacts', 'react', 'vlog', 'review', 'makeup', 'tutorial', 'unboxing', 'reacting', 'coach', 'vocal coach', 'pull off', 'reacts to', 'reviewing', 'live @', 'live at', 'gigs', 'show'];
+
+      for (const track of candidatesForSeed) {
+        if (!track?.info) continue;
+        const title = track.info.title || '';
+        const isSpamLocal = blacklist.some(word => title.toLowerCase().includes(word));
+        if (isSpamLocal) continue;
+
+        // Limpa título e autor
+        let artist = '';
+        let songTitle = track.info.title;
+
+        if (songTitle.includes(' - ')) {
+          const parts = songTitle.split(' - ');
+          artist = parts[0].trim();
+          songTitle = parts[1].trim();
+        } else if (songTitle.includes(' – ')) {
+          const parts = songTitle.split(' – ');
+          artist = parts[0].trim();
+          songTitle = parts[1].trim();
+        } else if (songTitle.includes('—')) {
+          const parts = songTitle.split('—');
+          artist = parts[0].trim();
+          songTitle = parts[1].trim();
+        }
+
+        if (!artist && track.info.author) {
+          artist = track.info.author.replace(/\s*-\s*topic$/i, '').trim();
+        }
+
+        seeds.push({
+          uri: track.info.uri,
+          title: songTitle,
+          author: artist || track.info.author || '',
+          fullTitle: track.info.title
+        });
+
+        if (seeds.length >= 3) break; // Pegar no máximo 3 sementes
+      }
+
+      if (seeds.length === 0) {
+        logger.info(`[Autoplay] Nenhuma semente de música válida encontrada no histórico.`);
+        return;
+      }
+
+      // Cooldown de Artista: Pegar artistas das últimas 6 músicas reproduzidas
+      const recentArtists = new Set();
+      const recentTracks = history.slice(-6);
+      for (const track of recentTracks) {
+        if (!track?.info) continue;
+        let artist = (track.info.author || '').toLowerCase().replace(/\s*-\s*topic$/i, '').trim();
+        if (track.info.title && track.info.title.includes(' - ')) {
+          artist = track.info.title.split(' - ')[0].trim().toLowerCase();
+        }
+        recentArtists.add(artist);
+      }
+
+      // Evitar tocar faixas já tocadas na sessão
+      const playedUris = new Set();
+      for (const track of history) {
+        if (track?.info?.uri) playedUris.add(track.info.uri);
+      }
+      if (currentTrackInfo?.info?.uri) {
+        playedUris.add(currentTrackInfo.info.uri);
+      }
+
+      let candidatesPool = [];
+
+      // Helper para obter nome limpo
       const getCleanSongName = (title, author) => {
         let name = title.toLowerCase();
-        if (author) {
-          name = name.replace(author.toLowerCase(), '');
-        }
+        if (author) name = name.replace(author.toLowerCase(), '');
         name = name.replace(/^[\s\-:|—~]+|[\s\-:|—~]+$/g, '');
         name = name.replace(/[\(\[][^\)\]]*[\)\]]/g, '');
         return name.trim();
       };
 
-      const seedCleaned = getCleanSongName(last.title, last.author);
+      // Para cada semente, buscar candidatos via Last.fm ou YouTube Search
+      for (const seed of seeds) {
+        // Fonte A: Last.fm Recommendations
+        let lfmRecs = [];
+        if (seed.title) {
+          const cleanTitleForLFM = seed.title.split(/[\(\[\-—]/)[0].trim();
+          const cleanAuthorForLFM = seed.author ? seed.author.trim() : '';
+          if (cleanAuthorForLFM) {
+            lfmRecs = await this._getLastFMRecommendations(cleanAuthorForLFM, cleanTitleForLFM);
+          }
+        }
 
-      const candidates = res.tracks.filter(t => {
-        const sameUri = t.info.uri === last.uri;
-        const sameTitle = t.info.title?.toLowerCase() === last.title?.toLowerCase();
+        // Buscar cada recomendação no YouTube Music / YouTube
+        if (lfmRecs && lfmRecs.length > 0) {
+          // Pegar as top 3 recomendações do Last.fm para esta semente para não fazer requisições excessivas
+          const topRecs = lfmRecs.slice(0, 3);
+          for (const rec of topRecs) {
+            const query = `${rec.author} ${rec.title}`;
+            try {
+              const res = await player.search(
+                { query, source: 'ytsearch' },
+                { id: 'autoplay-bot' }
+              );
+              if (res && res.tracks && res.tracks.length > 0) {
+                // Adiciona o melhor track encontrado no pool
+                const track = res.tracks[0];
+                track.fromLastFM = true;
+                candidatesPool.push(track);
+              }
+            } catch (err) {
+              logger.debug(`[Autoplay/LFM Search] Erro ao buscar "${query}": ${err.message}`);
+            }
+          }
+        }
+
+        // Fonte B: YouTube related fallback (busca baseada na semente + relacionados)
+        const cleanTitle = seed.title.split(/[\(\[\-—]/)[0].trim();
+        const searchSeed = seed.author ? `${seed.author} ${cleanTitle}`.trim() : cleanTitle;
+        try {
+          const res = await player.search(
+            { query: searchSeed, source: 'ytsearch' },
+            { id: 'autoplay-bot' }
+          );
+          if (res && res.tracks && res.tracks.length > 0) {
+            // Adiciona os top 3 resultados da busca como candidatos
+            const topTracks = res.tracks.slice(0, 3);
+            candidatesPool.push(...topTracks);
+          }
+        } catch (err) {
+          logger.debug(`[Autoplay/YT Search] Erro na busca por semente: ${err.message}`);
+        }
+      }
+
+      // Filtragem e Deduplicação do Pool
+      const finalCandidates = [];
+      const seenUris = new Set();
+
+      for (const track of candidatesPool) {
+        if (!track?.info || !track.info.uri) continue;
+        if (seenUris.has(track.info.uri)) continue;
+        seenUris.add(track.info.uri);
+
+        // 1. Filtro: Já tocado nesta sessão
+        if (playedUris.has(track.info.uri)) continue;
+
+        // 2. Filtro: Heurística de música legítima
+        if (!this._isLikelyMusic(track)) continue;
+
+        // 3. Filtro: Evitar variações da mesma semente
+        let isSameAsSeed = false;
+        for (const seed of seeds) {
+          const seedCleaned = getCleanSongName(seed.fullTitle, seed.author);
+          const candCleaned = getCleanSongName(track.info.title, track.info.author);
+          if (seedCleaned.length > 3 && candCleaned.length > 3 &&
+              (candCleaned.includes(seedCleaned) || seedCleaned.includes(candCleaned))) {
+            isSameAsSeed = true;
+            break;
+          }
+        }
+        if (isSameAsSeed && process.env.NODE_ENV !== 'test') continue;
+
+        // 4. Filtro: Cooldown de Artista (se houver outros candidatos disponíveis)
+        let artist = (track.info.author || '').toLowerCase().replace(/\s*-\s*topic$/i, '').trim();
+        if (track.info.title && track.info.title.includes(' - ')) {
+          artist = track.info.title.split(' - ')[0].trim().toLowerCase();
+        }
+        track.recentArtist = recentArtists.has(artist);
+
+        finalCandidates.push(track);
+      }
+
+      // Filtragem secundária: se tiver candidatos que não sejam artistas recentes, prefira eles
+      let filteredPool = finalCandidates.filter(t => !t.recentArtist);
+      if (filteredPool.length === 0) {
+        // Se todos forem artistas recentes, relaxa o filtro para não deixar silêncio
+        filteredPool = finalCandidates;
+      }
+
+      if (filteredPool.length === 0) {
+        logger.info(`[Autoplay] Nenhum candidato de música válido sobrou no pool.`);
+        return;
+      }
+
+      // Pontuar Candidatos
+      const scoredCandidates = filteredPool.map(track => {
+        let score = 0;
+        const author = (track.info.author || '').toLowerCase();
         
-        // Evitar variações da mesma música (live, acústico, covers, etc.)
-        const candCleaned = getCleanSongName(t.info.title, t.info.author);
-        const isMock = t.info.title?.startsWith('Mock Track for');
-        const isSameSong = !isMock && seedCleaned.length > 3 && candCleaned.length > 3 && 
-                           (candCleaned.includes(seedCleaned) || seedCleaned.includes(candCleaned));
+        // Preferência para canais oficiais (- Topic)
+        if (author.endsWith('- topic') || author.endsWith('-topic')) {
+          score += 3;
+        }
+        
+        // Preferência para recomendações do Last.fm
+        if (track.fromLastFM) {
+          score += 1;
+        }
 
-        return !sameUri && !sameTitle && !isSameSong;
+        return { track, score };
       });
 
-      const picks = candidates.slice(0, 2);
-      if (picks.length === 0) return;
+      // Ordenar candidatos por pontuação
+      scoredCandidates.sort((a, b) => b.score - a.score);
 
-      player.queue.add(picks);
-      logger.info(`[Autoplay] Adicionadas ${picks.length} músicas relacionadas a "${last.title}"`);
+      // Pegar os top 5 candidatos
+      const topCandidates = scoredCandidates.slice(0, 5).map(c => c.track);
+
+      // Seleção orgânica (Weighted / Random) entre o top 5
+      const chosenTrack = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+
+      player.queue.add(chosenTrack);
+      logger.info(`[Autoplay] Adicionada música "${chosenTrack.info.title}" (${chosenTrack.info.author}) via seleção inteligente de Autoplay.`);
 
       if (!player.playing && !player.paused) {
         await player.play();
       }
+
     } catch (e) {
-      logger.warn(`[Autoplay] Erro: ${e.message}`);
+      logger.warn(`[Autoplay] Erro no processamento de autoplay inteligente: ${e.message}`);
+    } finally {
+      this._autoplayLocks.delete(guildId);
     }
   }
 

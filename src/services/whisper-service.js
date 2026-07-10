@@ -314,10 +314,26 @@ class WhisperService {
      * Helper to detect and extract command from transcribed text
      */
     parseWakeWord(transcriptText) {
+        if (!transcriptText) return { detected: false, text: "", command: "" };
         const fullText = transcriptText.toLowerCase().trim();
+
+        // Ignorar alucinações comuns do Whisper e ruídos curtos de silêncio
+        const hallucinations = [
+            'legendas por', 'legendado por', 'legendas', 
+            'obrigado por assistir', 'obrigado pela transmissão',
+            'assista no youtube', 'inscreva-se', 'deixe seu like',
+            'transcrição por', 'traduzido por', 'obrigado.', 'obrigado',
+            'tchau.', 'tchau', 'yeah', 'você'
+        ];
+
+        if (hallucinations.includes(fullText) || fullText.length <= 1) {
+            logger.debug(`[Whisper] Ignorando possível alucinação/ruído: "${fullText}"`);
+            return { detected: false, text: fullText, command: "" };
+        }
+
         logger.debug(`[Whisper] Texto transcrevido: "${fullText}"`);
 
-        const wakeWordRegex = /\b(alfred[o]?|álfred[o]?|alfret|alferd|al\s+fred[o]?|afred|aufred|alfréd)\b/i;
+        const wakeWordRegex = /\b(alfred[o]?|álfred[o]?|alfret|alferd|al\s+fred[o]?|afred|aufred[o]?|alfréd|alberto?|albert|elfred[o]?|alfe|fred[d]?y|oferece[r]?|ao\s+fred|hafred|arfred[o]?|alferes|alfer[o]?|auferido|elvis|alvin|alver|auver|alfre|álfre|alfrer|frede)\b/i;
         const match = fullText.match(wakeWordRegex);
         const detected = match !== null;
 

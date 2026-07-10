@@ -11,6 +11,7 @@ const aiClient = require('../lib/ai-client');
 const factStore = require('../lib/fact-store');
 const memoryHandler = require('./memory-handler');
 const cacheService = require('../services/cache-service');
+const PromptProtection = require('../lib/prompt-protection');
 const { ExternalServiceError } = require('../services/error-handler');
 const { TASK_PROMPTS, buildPrompt } = require('../config/prompts');
 
@@ -158,7 +159,63 @@ async function getGuildInfo(guildId) {
  * @returns {Promise<string>} AI response
  */
 async function processQuestion(message, question, factContext = null, isVoice = false) {
+    // 🛡️ Proteção contra Prompt Injection: Ignora se já estiver bloqueado
+    const isBlocked = await PromptProtection.checkUserBlocked(message.author?.id);
+    if (isBlocked) {
+        return isVoice 
+            ? 'Acesso Negado. Você está silenciado por violações recorrentes de segurança.'
+            : '🚫 **Acesso Negado:** Você está silenciado por violações recorrentes de segurança.';
+    }
+
+    if (PromptProtection.isInjection(question)) {
+        const blockedNow = await PromptProtection.incrementAttempts(message.author.id, message.author.username);
+        if (blockedNow) {
+            return isVoice
+                ? 'Bloqueado. Você foi silenciado por tentar violar minhas diretrizes de segurança de forma recorrente.'
+                : '🚫 **Bloqueado:** Você foi silenciado por tentar violar minhas diretrizes de segurança de forma recorrente (limite de 3 tentativas excedido).';
+        }
+        return PromptProtection.getRejectionResponse();
+    }
+
+    let typingInterval = null;
+    let reaction = null;
+
     try {
+        // Detecção de mudança de assunto / reset de contexto
+        const cleanLower = question.toLowerCase()
+            .replace(/\b(alfred[o]?|álfred[o]?|alf)\b/g, '')
+            .replace(/[,!?.]/g, '')
+            .trim();
+        const subjectChangePatterns = [
+            /^(limpar?\s+contexto|muda(?:r)?\s+de\s+assunto|esquece(?:r)?\s+o\s+que\s+falei|esquece\s+tudo|limpar?\s+chat|outro\s+assunto|nova\s+conversa)$/i
+        ];
+        const isSubjectChange = subjectChangePatterns.some(p => p.test(cleanLower));
+
+        if (isSubjectChange) {
+            const key = contextKey(message.channelId, message.author?.id);
+            await redis.del(key);
+            const shortTermKey = `mem:short:${message.guildId || message.guild?.id || 'global'}:${message.author?.id}`;
+            await redis.del(shortTermKey);
+            logger.info(`[AI Handler] Contexto e short-term resetados por solicitação do usuário ${message.author?.username}`);
+            return isVoice 
+                ? 'Entendido. Contexto limpo. Sobre o que quer falar agora?'
+                : '🧹 **Contexto limpo com sucesso!** Vamos começar uma nova conversa. O que deseja falar agora?';
+        }
+
+        // Typing contínuo e reação temporária
+        if (!isVoice && message.channel?.sendTyping) {
+            message.channel.sendTyping().catch(() => {});
+            typingInterval = setInterval(() => {
+                message.channel.sendTyping().catch(() => {});
+            }, 5000);
+        }
+
+        if (!isVoice && typeof message.react === 'function') {
+            try {
+                reaction = await message.react('🤖');
+            } catch {}
+        }
+
         // Contexto por usuário — evita mistura com outras conversas no canal
         const context = await getContext(message.channelId, message.author?.id);
 
@@ -227,14 +284,23 @@ async function processQuestion(message, question, factContext = null, isVoice = 
         // Inject Memories directly into System Prompt (long-term do memory-manager)
         if (multiLayerContext.longTermContext) {
             systemPrompt += `\n\n### MEMÓRIAS RELEVANTES DO USUÁRIO (${message.author.username}):\n${multiLayerContext.longTermContext}\n\nUse essas informações para responder perguntas pessoais se necessário.`;
-        } else if (factContext && typeof factContext === 'string' && factContext.trim().length > 0) {
-            // Fallback para o factContext tradicional
-            systemPrompt += `\n\n### MEMÓRIAS RELEVANTES DO USUÁRIO (${message.author.username}):\n${factContext}\n\nUse essas informações para responder perguntas pessoais se necessário.`;
+        }
+
+        // Se houver contexto de suporte adicional (busca na web / memórias tradicionais), injetar também
+        if (factContext && typeof factContext === 'string' && factContext.trim().length > 0) {
+            if (!multiLayerContext.longTermContext || !multiLayerContext.longTermContext.includes(factContext.trim())) {
+                systemPrompt += `\n\n### CONTEXTO DE SUPORTE ADICIONAL (BUSCA/MEMÓRIA):\n${factContext}\n\nUse essas informações adicionais para responder à pergunta.`;
+            }
         }
 
         // 🆕 Injetar episódios marcantes
         if (multiLayerContext.episodicContext) {
             systemPrompt += `\n\n### MOMENTOS MARCANTES COM ${message.author.username.toUpperCase()}:\n${multiLayerContext.episodicContext}`;
+        }
+
+        // 🆕 Injetar grafo de conhecimento emaranhado do Vault do Obsidian (Graph-RAG)
+        if (multiLayerContext.graphContext) {
+            systemPrompt += `${multiLayerContext.graphContext}`;
         }
 
         // 🔥 RELACIONAMENTO: Injetar notas de relacionamento do fact-store (legado, complementar)
@@ -344,15 +410,18 @@ async function processQuestion(message, question, factContext = null, isVoice = 
     } catch (error) {
         logger.error('[AI Handler] Erro ao processar pergunta:', error);
         throw new ExternalServiceError('AI', error);
+    } finally {
+        if (typingInterval) {
+            clearInterval(typingInterval);
+        }
+        if (reaction) {
+            try {
+                await reaction.users.remove(message.client.user.id);
+            } catch {}
+        }
     }
 }
 
-/**
- * Handles the !pergunta command
- * 
- * @param {Object} message - Discord message
- * @param {string[]} args - Command arguments
- */
 async function handlePerguntaCommand(message, args) {
     if (args.length === 0) {
         await message.reply('❌ Por favor, faça uma pergunta. Exemplo: `!pergunta qual a capital do Brasil?`');
@@ -360,27 +429,7 @@ async function handlePerguntaCommand(message, args) {
     }
 
     const question = args.join(' ');
-
-    // Search for relevant memories
-    let factContext = null;
-    try {
-        const embedding = await aiClient.getEmbedding(question);
-        if (embedding) {
-            const memories = factStore.getTopSimilarMemories(
-                message.guildId,
-                message.author.id,
-                embedding,
-                3
-            );
-            if (memories && memories.length > 0) {
-                factContext = memories.map((m, i) => `Fato ${i + 1}: ${m.message}`).join('\n');
-            }
-        }
-    } catch (e) {
-        logger.warn('[AI Handler] Erro ao buscar memórias similares:', e.message);
-    }
-
-    const response = await processQuestion(message, question, factContext);
+    const response = await processQuestion(message, question);
     await message.reply(response);
 }
 
@@ -450,6 +499,23 @@ async function handleTraduzirCommand(message, args) {
     const targetLanguage = args[0];
     const textToTranslate = args.slice(1).join(' ');
 
+    // 🛡️ Proteção contra Prompt Injection: Ignora se já estiver bloqueado
+    const isBlocked = await PromptProtection.checkUserBlocked(message.author?.id);
+    if (isBlocked) {
+        await message.reply('🚫 **Acesso Negado:** Você está silenciado por violações recorrentes de segurança.');
+        return;
+    }
+
+    if (PromptProtection.isInjection(textToTranslate)) {
+        const blockedNow = await PromptProtection.incrementAttempts(message.author.id, message.author.username);
+        if (blockedNow) {
+            await message.reply('🚫 **Bloqueado:** Você foi silenciado por tentar violar minhas diretrizes de segurança de forma recorrente (limite de 3 tentativas excedido).');
+        } else {
+            await message.reply(PromptProtection.getRejectionResponse());
+        }
+        return;
+    }
+
     try {
         // Use centralized prompt with target language
         const systemPrompt = buildPrompt('translation', { targetLanguage });
@@ -482,6 +548,23 @@ async function handleCodigoCommand(message, args) {
     }
 
     const description = args.join(' ');
+
+    // 🛡️ Proteção contra Prompt Injection: Ignora se já estiver bloqueado
+    const isBlocked = await PromptProtection.checkUserBlocked(message.author?.id);
+    if (isBlocked) {
+        await message.reply('🚫 **Acesso Negado:** Você está silenciado por violações recorrentes de segurança.');
+        return;
+    }
+
+    if (PromptProtection.isInjection(description)) {
+        const blockedNow = await PromptProtection.incrementAttempts(message.author.id, message.author.username);
+        if (blockedNow) {
+            await message.reply('🚫 **Bloqueado:** Você foi silenciado por tentar violar minhas diretrizes de segurança de forma recorrente (limite de 3 tentativas excedido).');
+        } else {
+            await message.reply(PromptProtection.getRejectionResponse());
+        }
+        return;
+    }
 
     try {
         // Use centralized prompt

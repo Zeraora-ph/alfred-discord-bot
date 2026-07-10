@@ -147,4 +147,25 @@ describe('VoiceListener Fixes', () => {
         voiceListener.startRecording('guild123', 'user456', receiver);
         expect(subscribeSpy).not.toHaveBeenCalled();
     });
+
+    test('startRecording allows recording when speaking (barge-in) but skips if processing in the active guild', () => {
+        const subscribeSpy = jest.fn().mockReturnValue({ on: jest.fn(), pipe: jest.fn() });
+        const receiver = { subscribe: subscribeSpy };
+
+        // registrar conexão ativa
+        voiceListener.connections.set('guild123', { connection: {} });
+
+        // caso 1: falando mas não processando -> permite gravar (barge-in)
+        voiceListener.setSpeaking('guild123', true);
+        voiceListener.setProcessing('guild123', false);
+        voiceListener.startRecording('guild123', 'user456', receiver);
+        expect(subscribeSpy).toHaveBeenCalled();
+
+        // caso 2: processando -> bloqueia gravação
+        subscribeSpy.mockClear();
+        voiceListener.setSpeaking('guild123', false);
+        voiceListener.setProcessing('guild123', true);
+        voiceListener.startRecording('guild123', 'user456', receiver);
+        expect(subscribeSpy).not.toHaveBeenCalled();
+    });
 });

@@ -95,12 +95,59 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_relationships_timestamp ON user_relationships(timestamp DESC);
 `);
 
+// ============================================
+// 🔒 PRIVACIDADE & CONSENTIMENTO DE VOZ (Diferencial VenusBot)
+// ============================================
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS voice_consent (
+    user_id TEXT PRIMARY KEY,
+    consented INTEGER NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`).run();
+
+// Função auxiliar de sincronização com o Vault do Obsidian
+async function syncUserProfileToVault(guildId, userId, username = null) {
+  try {
+    const vaultService = require('../services/vault-service');
+    
+    // Buscar todas as memórias do SQLite para este usuário
+    const memories = db.prepare('SELECT message FROM memories WHERE guild_id = ? AND user_id = ?').all(guildId, userId).map(r => r.message);
+    
+    // Buscar notas de relacionamento do SQLite para este usuário
+    const relationships = db.prepare('SELECT note FROM user_relationships WHERE guild_id = ? AND user_id = ?').all(guildId, userId).map(r => r.note);
+    
+    // Obter perfil de afinidade se o serviço de relacionamento existir
+    let profile = null;
+    try {
+      const userRelService = require('../services/user-relationship-service');
+      profile = userRelService.getProfile ? userRelService.getProfile(userId, guildId) : null;
+    } catch {}
+
+    const data = {
+      nickname: profile?.nickname || 'Nenhum',
+      preferredTone: profile?.preferredTone || 'neutro',
+      affinity: profile?.affinityScore || 0,
+      memories,
+      relationships,
+      guildId
+    };
+
+    const actualUsername = username || profile?.nickname || `user_${userId}`;
+    await vaultService.saveUserProfile(userId, actualUsername, data);
+  } catch (err) {
+    const logger = require('./logger');
+    logger.warn(`[VaultSync] Erro ao sincronizar perfil do usuário ${userId}: ${err.message}`);
+  }
+}
+
 // Salva uma mensagem do usuário, agora também por servidor e com embedding opcional
 function saveMemory(guildId, userId, message, embedding = null) {
   db.prepare('INSERT INTO memories (guild_id, user_id, message, embedding) VALUES (?, ?, ?, ?)')
     .run(guildId, userId, message, embedding ? JSON.stringify(embedding) : null);
   const logger = require('./logger');
   logger.info(`[MEMÓRIA] Salvo: "${message}" para user ${userId} na guild ${guildId}`);
+  syncUserProfileToVault(guildId, userId).catch(() => {});
 }
 
 // Busca mensagem semelhante do mesmo usuário e servidor
@@ -200,6 +247,8 @@ function getGuildInfo(guildId) {
 function setGuildInfo(guildId, info, persona) {
   db.prepare('INSERT OR REPLACE INTO guild_info (guild_id, info, persona) VALUES (?, ?, ?)')
     .run(guildId, info, persona);
+  const vaultService = require('../services/vault-service');
+  vaultService.saveGuildPersona(guildId, info, persona).catch(() => {});
 }
 
 // Calcula similaridade de cosseno entre dois arrays
@@ -324,6 +373,7 @@ function saveRelationship(guildId, userId, username, note, category = 'geral', s
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(guildId, userId, username, note, category, sourceUserId, embedding ? JSON.stringify(embedding) : null);
   logger.info(`[Relacionamento] Salvo para ${username}: "${note}" (${category})`);
+  syncUserProfileToVault(guildId, userId, username).catch(() => {});
 }
 
 /**
@@ -466,6 +516,20 @@ function getPlayHistory(guildId, limit = 5) {
   `).all(guildId, limit);
 }
 
+function setVoiceConsent(userId, consented) {
+  db.prepare(`
+    INSERT OR REPLACE INTO voice_consent (user_id, consented)
+    VALUES (?, ?)
+  `).run(userId, consented ? 1 : 0);
+}
+
+function hasVoiceConsent(userId) {
+  const row = db.prepare(`
+    SELECT consented FROM voice_consent WHERE user_id = ?
+  `).get(userId);
+  return row ? row.consented === 1 : false;
+}
+
 module.exports = {
   saveMemory,
   getSimilarMemory,
@@ -502,5 +566,8 @@ module.exports = {
   deletePlaylist,
   listPlaylists,
   addPlayHistory,
-  getPlayHistory
+  getPlayHistory,
+  // 🔒 Privacidade & Consentimento de Voz
+  setVoiceConsent,
+  hasVoiceConsent
 }; 

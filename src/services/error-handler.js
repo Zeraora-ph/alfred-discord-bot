@@ -204,25 +204,39 @@ function expressErrorHandler() {
  * @param {Error} error - Error to handle
  * @param {string} context - Context description
  */
-async function handleDiscordError(message, error, context = 'processing') {
+async function handleDiscordError(messageOrInteraction, error, context = 'processing') {
+    const isInteraction = messageOrInteraction && (typeof messageOrInteraction.isChatInputCommand === 'function' || !messageOrInteraction.author);
+    const userId = isInteraction ? messageOrInteraction?.user?.id : messageOrInteraction?.author?.id;
+    const guildId = messageOrInteraction?.guildId;
+    const channelId = messageOrInteraction?.channelId;
+
     logError(error, {
         context,
-        guildId: message?.guildId,
-        channelId: message?.channelId,
-        userId: message?.author?.id
+        guildId,
+        channelId,
+        userId
     });
 
+    let replyMsg = '❌ Estou passando por instabilidades técnicas. Por favor, tente novamente em alguns instantes.';
+    if (error instanceof RateLimitError) {
+        replyMsg = `⏳ ${error.userMessage}`;
+    } else if (error instanceof AuthorizationError) {
+        replyMsg = `🔒 ${error.userMessage}`;
+    } else if (error instanceof ExternalServiceError) {
+        replyMsg = `⚠️ ${error.userMessage}`;
+    } else if (error instanceof ValidationError) {
+        replyMsg = `❌ ${error.userMessage}`;
+    }
+
     try {
-        if (error instanceof RateLimitError) {
-            await message.reply(`⏳ ${error.userMessage}`);
-        } else if (error instanceof AuthorizationError) {
-            await message.reply(`🔒 ${error.userMessage}`);
-        } else if (error instanceof ExternalServiceError) {
-            await message.reply(`⚠️ ${error.userMessage}`);
-        } else if (error instanceof ValidationError) {
-            await message.reply(`❌ ${error.userMessage}`);
+        if (isInteraction) {
+            if (messageOrInteraction.replied || messageOrInteraction.deferred) {
+                await messageOrInteraction.followUp({ content: replyMsg, ephemeral: true });
+            } else {
+                await messageOrInteraction.reply({ content: replyMsg, ephemeral: true });
+            }
         } else {
-            await message.reply('❌ Estou passando por instabilidades técnicas. Por favor, tente novamente em alguns instantes.');
+            await messageOrInteraction.reply(replyMsg);
         }
     } catch (replyError) {
         logger.error('Failed to send error reply:', { originalError: error.message, replyError: replyError.message });

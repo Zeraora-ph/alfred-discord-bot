@@ -202,7 +202,7 @@ def detect_wake_word():
             import re
             
             # Detectar "alfred" ou variações no início ou em qualquer lugar usando regex
-            wake_word_pattern = r'\b(alfred[o]?|álfred[o]?|alfret|alferd|al\s+fred[o]?|afred|aufred|alfréd)\b'
+            wake_word_pattern = r'\b(alfred[o]?|álfred[o]?|alfret|alferd|al\s+fred[o]?|afred|aufred[o]?|alfréd|alberto?|albert|elfred[o]?|alfe|fred[d]?y|oferece[r]?|ao\s+fred|hafred|arfred[o]?|alferes|alfer[o]?|auferido|elvis|alvin|alver|auver|alfre|álfre|alfrer|frede)\b'
             match = re.search(wake_word_pattern, full_text, re.IGNORECASE)
             detected = match is not None
             

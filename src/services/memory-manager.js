@@ -160,7 +160,8 @@ async function extractAndStoreFacts(userId, guildId, username, messages) {
 Retorne APENAS uma lista com um fato por linha, começando com "-".
 Se não houver fatos relevantes, retorne "NENHUM".
 Fatos relevantes: preferências, dados pessoais mencionados, gostos, opiniões fortes, planos.
-NÃO inclua fatos triviais ou temporários.`
+NÃO inclua fatos triviais ou temporários.
+ATENÇÃO: Sempre que identificar conceitos significativos, jogos, bandas, tecnologias, cidades ou tópicos importantes, envolva-os em links de estilo Wiki do Obsidian, como [[Minecraft]], [[The Beatles]] ou [[São Paulo]].`
             },
             { role: 'user', content: conversationText }
         ];
@@ -305,11 +306,24 @@ async function getUserContext(userId, guildId, currentMessage, username) {
         getEpisodes(userId, 3)
     ]);
 
+    // Extrair memórias encontradas a partir do longTermContext para repassar ao vault
+    const matchedMemories = longTermContext
+        ? longTermContext.split('\n').map(line => line.replace(/^Fato \d+:\s*/, '').trim())
+        : [];
+
+    let graphContext = '';
+    try {
+        const vaultService = require('./vault-service');
+        graphContext = await vaultService.getEntangledContext(currentMessage, matchedMemories, 1);
+    } catch (err) {
+        logger.warn(`[MemoryManager] Erro ao carregar contexto emaranhado do Vault: ${err.message}`);
+    }
+
     const episodicContext = episodes.length > 0
         ? episodes.map(e => `- ${e.description}`).join('\n')
         : '';
 
-    return { shortTerm, longTermContext, episodicContext };
+    return { shortTerm, longTermContext, episodicContext, graphContext };
 }
 
 // ============================================

@@ -98,7 +98,8 @@ A crônica deve ser estruturada da seguinte forma:
 
         try {
             logger.info(`[RPG] 🧠 Gerando crônica com IA para guild ${guildId}...`);
-            const chronicle = await aiClient.chat(messages);
+            const response = await aiClient.chat(messages);
+            const chronicle = response.choices?.[0]?.message?.content || '';
             const chroniclePath = path.join(SESSIONS_DIR, `${guildId}-cronica-${date}.md`);
             fs.writeFileSync(chroniclePath, chronicle, 'utf8');
 

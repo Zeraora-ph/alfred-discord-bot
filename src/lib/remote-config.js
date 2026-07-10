@@ -1,8 +1,9 @@
 /**
  * Sistema de Configuração Remota - Alfred Bot
+ * ALFRED DISCORD BOT - OPEN SOURCE
  * 
- * Este sistema permite que o bot rode sem acesso às chaves sensíveis.
- * As configurações são gerenciadas remotamente por um servidor de config.
+ * Este sistema permite que o cliente rode o bot sem acesso às chaves sensíveis
+ * As configurações são gerenciadas remotamente pelo proprietário
  */
 
 const axios = require('axios');

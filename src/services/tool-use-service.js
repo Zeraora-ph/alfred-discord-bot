@@ -120,6 +120,87 @@ const TOOLS = [
                 required: ['ativo']
             }
         }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'rolar_dados',
+            description: 'Rola dados de RPG com notação padrão. Use quando o usuário pedir para rolar/jogar dados, fazer um ataque, teste ou dano. Exemplos de expressão: "1d20+5", "2d6", "4d6kh3", "vantagem+3", "8d6".',
+            parameters: {
+                type: 'object',
+                properties: {
+                    expressao: { type: 'string', description: 'Expressão de dados, ex: 1d20+5, 2d6+3, vantagem+2' },
+                    rotulo: { type: 'string', description: 'Rótulo opcional da rolagem, ex: "Ataque de Espada"' }
+                },
+                required: ['expressao']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'rolar_teste_ficha',
+            description: 'Rola um teste de perícia, salvaguarda ou atributo usando a ficha ATIVA do usuário (aplica o modificador correto automaticamente). Use quando o usuário disser algo como "rola furtividade pra mim", "faz um teste de força", "salvaguarda de destreza".',
+            parameters: {
+                type: 'object',
+                properties: {
+                    teste: { type: 'string', description: 'Nome da perícia (furtividade, atletismo, percepção...), atributo (força, destreza...) ou "salvaguarda <atributo>"' },
+                    tipo: { type: 'string', enum: ['normal', 'vantagem', 'desvantagem'], description: 'Com vantagem/desvantagem. Padrão: normal' }
+                },
+                required: ['teste']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'consultar_ficha',
+            description: 'Consulta a ficha de personagem ATIVA do usuário (PV, CA, atributos, nível, classe). Use quando ele perguntar sobre o próprio personagem ("quantos PV eu tenho?", "qual minha CA?", "me lembra meus atributos").',
+            parameters: { type: 'object', properties: {} }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'aplicar_dano_cura',
+            description: 'Aplica dano ou cura na ficha ATIVA do usuário e atualiza os PV. Use quando ele disser "tomei 8 de dano", "me curei 5", "recebi 12 de dano".',
+            parameters: {
+                type: 'object',
+                properties: {
+                    acao: { type: 'string', enum: ['dano', 'cura'], description: 'dano ou cura' },
+                    valor: { type: 'number', description: 'Quantidade de PV' }
+                },
+                required: ['acao', 'valor']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'consultar_regra',
+            description: 'Consulta as regras OFICIAIS de D&D 5e nos livros indexados (Livro do Jogador e Guia do Mestre) e devolve os trechos exatos com a página. Use SEMPRE que o usuário perguntar como funciona uma regra, magia, condição, item mágico, classe, raça, monstro ou mecânica ("como funciona X?", "o que a condição Y faz?", "quanto de dano a magia Z causa?"). Responda com base SÓ nos trechos e cite a página.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    pergunta: { type: 'string', description: 'A dúvida de regra, em português. Ex: "como funciona ataque de oportunidade?"' }
+                },
+                required: ['pergunta']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'controlar_combate',
+            description: 'Controla o combate em andamento neste canal: avançar o turno, mostrar a ordem de iniciativa/turno atual, ou encerrar. Use quando o usuário disser "próximo turno", "passa a vez", "de quem é a vez?", "encerra o combate". Para INICIAR um combate ou ADICIONAR combatentes, oriente o usuário a usar os comandos /combate iniciar, /combate entrar e /combate add.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    acao: { type: 'string', enum: ['proximo', 'status', 'encerrar'], description: 'proximo = avança o turno; status = mostra a ordem e de quem é a vez; encerrar = termina o combate' }
+                },
+                required: ['acao']
+            }
+        }
     }
 ];
 
@@ -215,8 +296,120 @@ async function executeTool(toolName, args, message) {
                 const guildId = message.guild?.id || message.guildId;
                 musicPlayer.silentMode.set(guildId, args.ativo);
                 logger.info(`[RPG] Modo silencioso definido via IA para ${args.ativo} na guild ${guildId}`);
-                
+
                 return `Modo silencioso (RPG) definido para ${args.ativo ? 'ATIVADO' : 'DESATIVADO'}.`;
+            }
+
+            case 'rolar_dados': {
+                const dice = require('./dice-service');
+                try {
+                    const r = dice.roll(args.expressao);
+                    const label = args.rotulo ? `${args.rotulo}: ` : '';
+                    const crit = r.isNat20 ? ' (CRÍTICO! 🌟)' : r.isNat1 ? ' (FALHA CRÍTICA! 💀)' : '';
+                    return `🎲 ${label}${r.expression} → ${r.text} = **${r.total}**${crit}`;
+                } catch (e) {
+                    return `Não consegui rolar "${args.expressao}": ${e.message}`;
+                }
+            }
+
+            case 'rolar_teste_ficha': {
+                const rpgDb = require('../lib/rpg-db');
+                const charService = require('./character-sheet-service');
+                const guildId = message.guild?.id || message.guildId;
+                const userId = message.author.id;
+                const character = rpgDb.getActiveCharacter(guildId, userId);
+                if (!character) return 'O usuário não tem ficha ativa. Sugira criar uma com /ficha criar.';
+
+                const mode = ['vantagem', 'desvantagem'].includes(args.tipo) ? args.tipo : 'normal';
+                const key = charService.normalizeKey(args.teste).replace(/\s+/g, '_');
+                const abilityAliases = { forca: 'str', for: 'str', destreza: 'dex', des: 'dex', constituicao: 'con', con: 'con', inteligencia: 'int', int: 'int', sabedoria: 'wis', sab: 'wis', carisma: 'cha', car: 'cha' };
+
+                let roll, nome;
+                if (charService.SKILLS[key]) {
+                    roll = charService.rollSkill(character, key, mode);
+                    nome = `perícia ${roll.skill}`;
+                } else if (key.startsWith('salvaguarda') || key.startsWith('save')) {
+                    const abToken = charService.normalizeKey(args.teste).split(/\s+/).pop();
+                    const ab = abilityAliases[abToken];
+                    if (!ab) return `Não reconheci o teste "${args.teste}".`;
+                    roll = charService.rollSave(character, ab, mode);
+                    nome = `salvaguarda de ${roll.ability}`;
+                } else if (abilityAliases[key]) {
+                    roll = charService.rollAbility(character, abilityAliases[key], mode);
+                    nome = `teste de ${roll.ability}`;
+                } else {
+                    return `Não reconheci "${args.teste}" como perícia, atributo ou salvaguarda.`;
+                }
+
+                const crit = roll.result.isNat20 ? ' (CRÍTICO! 🌟)' : roll.result.isNat1 ? ' (FALHA CRÍTICA! 💀)' : '';
+                return `🎲 ${character.sheet.name} — ${nome}${mode !== 'normal' ? ` (${mode})` : ''}: ${roll.result.text} ${charService.fmtMod(roll.bonus)} = **${roll.result.total}**${crit}`;
+            }
+
+            case 'consultar_ficha': {
+                const rpgDb = require('../lib/rpg-db');
+                const charService = require('./character-sheet-service');
+                const guildId = message.guild?.id || message.guildId;
+                const character = rpgDb.getActiveCharacter(guildId, message.author.id);
+                if (!character) return 'O usuário não tem ficha ativa. Sugira criar uma com /ficha criar.';
+                charService.computeDerived(character.sheet);
+                const s = character.sheet, d = s.derived;
+                const attrs = charService.ABILITIES.map(a => `${charService.ABILITY_SHORT[a]} ${s.attributes[a]}(${charService.fmtMod(d.mods[a])})`).join(', ');
+                return `Ficha ativa: ${s.name}, ${s.race} ${s.class} nível ${s.level}. PV ${s.currentHp}/${s.maxHp}${s.tempHp ? ` (+${s.tempHp} temp)` : ''}, CA ${s.armorClass}, Iniciativa ${charService.fmtMod(d.initiative)}, Percepção Passiva ${d.passivePerception}, Bônus de Proficiência ${charService.fmtMod(d.profBonus)}. Atributos: ${attrs}.`;
+            }
+
+            case 'aplicar_dano_cura': {
+                const rpgDb = require('../lib/rpg-db');
+                const charService = require('./character-sheet-service');
+                const guildId = message.guild?.id || message.guildId;
+                const character = rpgDb.getActiveCharacter(guildId, message.author.id);
+                if (!character) return 'O usuário não tem ficha ativa. Sugira criar uma com /ficha criar.';
+                const valor = Math.max(0, Math.floor(Number(args.valor) || 0));
+                if (args.acao === 'cura') {
+                    const res = charService.heal(character, valor);
+                    return `💚 ${character.sheet.name} recuperou ${valor} PV. Agora está com ${res.currentHp}/${res.maxHp}.`;
+                }
+                const res = charService.applyDamage(character, valor);
+                return `💥 ${character.sheet.name} tomou ${valor} de dano. Agora está com ${res.currentHp}/${res.maxHp}${res.down ? ' — CAÍDO (0 PV)!' : ''}.`;
+            }
+
+            case 'consultar_regra': {
+                const rag = require('./rules-rag-service');
+                if (!rag.isReady()) {
+                    return 'Nenhum livro de regras foi indexado ainda. Avise que o dono precisa rodar a ingestão dos livros (npm run ingest:rules).';
+                }
+                const hits = await rag.search(args.pergunta, { topK: 4 });
+                if (!hits.length) {
+                    return `Não encontrei nada sobre "${args.pergunta}" nos livros de regras indexados (Livro do Jogador / Guia do Mestre). Não invente a regra — diga que não achou.`;
+                }
+                const trechos = hits
+                    .map(h => `[${h.source}, pág. ${h.page}]\n${h.content}`)
+                    .join('\n\n---\n\n');
+                return `Trechos oficiais encontrados. Responda a pergunta do usuário com base SOMENTE neles e cite a página entre parênteses:\n\n${trechos}`;
+            }
+
+            case 'controlar_combate': {
+                const rpgDb = require('../lib/rpg-db');
+                const combat = require('./combat-service');
+                const channelId = message.channel?.id || message.channelId;
+                const state = rpgDb.getCombat(channelId);
+                if (!state) return 'Não há combate ativo neste canal. Sugira iniciar com /combate iniciar.';
+
+                if (args.acao === 'status') {
+                    const actor = combat.currentActor(state);
+                    const ordem = state.combatants
+                        .map((c, i) => `${i === state.turnIndex ? '▶️' : '•'} ${c.name} (ini ${c.init}, ${c.hp}/${c.maxHp} PV)`)
+                        .join('; ');
+                    return `Combate na rodada ${state.round}. Ordem: ${ordem || '(vazio)'}. Vez de: ${actor ? actor.name : '—'}.`;
+                }
+                if (args.acao === 'encerrar') {
+                    rpgDb.endCombat(channelId);
+                    return `Combate encerrado após ${state.round} rodada(s).`;
+                }
+                // proximo
+                if (!state.combatants.length) return 'O combate não tem combatentes ainda. Sugira /combate entrar ou /combate add.';
+                const { actor, wrapped } = combat.nextTurn(state);
+                rpgDb.saveCombat(state.channelId, state.guildId, state);
+                return `${wrapped ? `Nova rodada (${state.round}). ` : ''}Agora é a vez de ${actor ? actor.name : '—'}.`;
             }
 
             default:

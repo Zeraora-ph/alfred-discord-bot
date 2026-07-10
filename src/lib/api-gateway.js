@@ -1,7 +1,9 @@
 /**
  * API Gateway - Alfred Bot
+ * ALFRED DISCORD BOT - OPEN SOURCE
  * 
- * Centraliza e gerencia chamadas para APIs externas.
+ * Este sistema centraliza todas as chamadas para APIs externas
+ * As chaves ficam no servidor do proprietário, não no cliente
  */
 
 const axios = require('axios');

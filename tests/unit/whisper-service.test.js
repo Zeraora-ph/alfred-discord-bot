@@ -30,4 +30,10 @@ describe('WhisperService - parseWakeWord', () => {
         expect(result.detected).toBe(false);
         expect(result.command).toBe('');
     });
+
+    test('should ignore common Whisper hallucinations', () => {
+        const result = whisperService.parseWakeWord('legendas por');
+        expect(result.detected).toBe(false);
+        expect(result.command).toBe('');
+    });
 });

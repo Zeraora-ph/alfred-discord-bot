@@ -12,6 +12,8 @@ const { ExternalServiceError } = require('../services/error-handler');
 // External API Integrations
 // ============================================
 
+const redis = require('../lib/redis-client');
+
 /**
  * Fetches weather data from OpenWeatherMap
  * 
@@ -24,11 +26,27 @@ async function fetchWeather(city) {
         throw new Error('OPENWEATHERMAP_API_KEY não configurada');
     }
 
+    const key = `cache:weather:${city.toLowerCase().trim()}`;
+    try {
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+    } catch (e) {
+        logger.warn('[Utility] Erro ao ler cache de tempo:', e);
+    }
+
     const axios = require('axios');
     const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${apiKey}&units=metric&lang=pt_br`;
 
     const response = await axios.get(url, { timeout: 10000 });
-    return response.data;
+    const data = response.data;
+
+    try {
+        await redis.setex(key, 300, JSON.stringify(data)); // 5 min TTL
+    } catch (e) {
+        logger.warn('[Utility] Erro ao salvar cache de tempo:', e);
+    }
+
+    return data;
 }
 
 /**
@@ -43,16 +61,31 @@ async function fetchMovie(title) {
         throw new Error('OMDB_API_KEY não configurada');
     }
 
+    const key = `cache:movie:${title.toLowerCase().trim()}`;
+    try {
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+    } catch (e) {
+        logger.warn('[Utility] Erro ao ler cache de filme:', e);
+    }
+
     const axios = require('axios');
     const url = `http://www.omdbapi.com/?t=${encodeURIComponent(title)}&apikey=${apiKey}`;
 
     const response = await axios.get(url, { timeout: 10000 });
+    const data = response.data;
 
-    if (response.data.Response === 'False') {
-        throw new Error(response.data.Error || 'Filme não encontrado');
+    if (data.Response === 'False') {
+        throw new Error(data.Error || 'Filme não encontrado');
     }
 
-    return response.data;
+    try {
+        await redis.setex(key, 3600, JSON.stringify(data)); // 1 hora TTL
+    } catch (e) {
+        logger.warn('[Utility] Erro ao salvar cache de filme:', e);
+    }
+
+    return data;
 }
 
 /**
@@ -67,16 +100,33 @@ async function fetchCity(cityName) {
         throw new Error('GEONAMES_USERNAME não configurado');
     }
 
+    const key = `cache:city:${cityName.toLowerCase().trim()}`;
+    try {
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+    } catch (e) {
+        logger.warn('[Utility] Erro ao ler cache de cidade:', e);
+    }
+
     const axios = require('axios');
-    const url = `http://api.geonames.org/searchJSON?q=${encodeURIComponent(cityName)}&maxRows=1&username=${username}`;
+    const url = `http://api.geonames.org/searchJSON?q=${encodeURIComponent(cityName)}&maxRows=1&username=${username}&lang=pt`;
 
     const response = await axios.get(url, { timeout: 10000 });
+    const data = response.data;
 
-    if (!response.data.geonames || response.data.geonames.length === 0) {
+    if (!data.geonames || data.geonames.length === 0) {
         throw new Error('Cidade não encontrada');
     }
 
-    return response.data.geonames[0];
+    const city = data.geonames[0];
+
+    try {
+        await redis.setex(key, 300, JSON.stringify(city)); // 5 min TTL
+    } catch (e) {
+        logger.warn('[Utility] Erro ao salvar cache de cidade:', e);
+    }
+
+    return city;
 }
 
 /**
@@ -93,11 +143,27 @@ async function googleSearch(query) {
         throw new Error('GOOGLE_API_KEY ou GOOGLE_CSE_ID não configurados');
     }
 
+    const key = `cache:search:${query.toLowerCase().trim()}`;
+    try {
+        const cached = await redis.get(key);
+        if (cached) return JSON.parse(cached);
+    } catch (e) {
+        logger.warn('[Utility] Erro ao ler cache de busca:', e);
+    }
+
     const axios = require('axios');
     const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cseId}&q=${encodeURIComponent(query)}&num=5`;
 
     const response = await axios.get(url, { timeout: 10000 });
-    return response.data.items || [];
+    const items = response.data.items || [];
+
+    try {
+        await redis.setex(key, 3600, JSON.stringify(items)); // 1 hora TTL
+    } catch (e) {
+        logger.warn('[Utility] Erro ao salvar cache de busca:', e);
+    }
+
+    return items;
 }
 
 // ============================================

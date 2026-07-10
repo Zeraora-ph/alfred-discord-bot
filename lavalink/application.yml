@@ -10,7 +10,7 @@ lavalink:
       repository: "https://maven.lavalink.dev/releases"
       snapshot: false
   server:
-    password: "alfredmusicbot2026"
+    password: "${LAVALINK_PASSWORD:alfredmusicbot2026}"
     sources:
       youtube: false # DESABILITADO (Usa o plugin agora)
       bandcamp: true
@@ -62,10 +62,14 @@ plugins:
       - "ytsearch:\"%ISRC%\""
       - "ytsearch:%QUERY%"
     sources:
-      spotify: false
+      spotify: true
       applemusic: false
       deezer: false
       yandexmusic: false
+    spotify:
+      clientId: "1d793cf425df49a6af442df2257ec3b5"
+      clientSecret: "ab99b644eccf48979b252f74e3504c19"
+      countryCode: "BR"
 
 metrics:
   prometheus:
@@ -82,9 +86,9 @@ logging:
   level:
     root: INFO
     lavalink: INFO
-    lavalink.server.player: DEBUG
-    moe.kyokobot.koe: DEBUG
-    com.sedmelluq.discord.lavaplayer.tools.io.NetworkInterface: DEBUG
+    lavalink.server.player: INFO
+    moe.kyokobot.koe: INFO
+    com.sedmelluq.discord.lavaplayer.tools.io.NetworkInterface: INFO
   
   logback:
     rollingpolicy:

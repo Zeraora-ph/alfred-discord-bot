@@ -38,12 +38,12 @@ function isMusicRelated(content) {
 /**
  * Detects if this is a music command and extracts details
  */
-function detectMusicCommand(content) {
+async function detectMusicCommand(content) {
     const client = require('../lib/discord-client');
     const musicPlayer = client.musicPlayer;
 
     if (musicPlayer?.detectMusicCommand) {
-        return musicPlayer.detectMusicCommand(content);
+        return await musicPlayer.detectMusicCommand(content);
     }
 
     return null;
@@ -64,7 +64,7 @@ async function handleMusicMessage(message) {
         return false;
     }
 
-    const command = musicPlayer.detectMusicCommand(message.content);
+    const command = await musicPlayer.detectMusicCommand(message.content);
 
     if (!command) {
         return false;

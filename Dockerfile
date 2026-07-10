@@ -1,11 +1,13 @@
 # Dockerfile para Alfred Bot
+# PROPRIEDADE EXCLUSIVA DE PEDRO HENRIQUE
 
 FROM node:18-alpine
 
-# Metadados
+# Informações do proprietário
+LABEL maintainer="Pedro Henrique <seu-email@dominio.com>"
 LABEL description="Alfred Bot - Discord AI Assistant"
 LABEL version="1.0"
-LABEL license="MIT"
+LABEL license="PROPRIETARY"
 
 # Definir diretório de trabalho
 WORKDIR /app

@@ -101,7 +101,7 @@ function isRateLimit(error) {
         || lowerMsg.includes('quota')
         || lowerMsg.includes('limit exceeded');
 
-    return status === 429 || status === 400 || status === 403 || isBillingOrCredit;
+    return status === 429 || isBillingOrCredit;
 }
 
 /**
