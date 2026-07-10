@@ -96,7 +96,7 @@ graph TD
 
 ### 1. Instalar Dependências
 ```bash
-git clone https://github.com/seu-usuario/alfred-discord-bot.git
+git clone https://github.com/Zeraora-ph/alfred-discord-bot.git
 cd alfred-discord-bot
 npm install
 ```
