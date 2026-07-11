@@ -84,17 +84,17 @@ graph TD
 
 ## 🎥 Demonstração de Funcionamento
 
-Abaixo você pode conferir exemplos práticos do Alfred em ação:
+Abaixo você pode conferir exemplos práticos do Alfred em ação. Clique nas imagens para assistir aos vídeos:
 
 ### ⚙️ Chamadas de Funções Inteligentes (Tool Use)
 O Alfred decide autonomamente quando utilizar ferramentas locais e externas para enriquecer a conversa (pesquisar na web, checar previsão do tempo, buscar informações de filmes ou gerenciar as fichas de RPG):
 
-<video src="docs/media/alfred_functions.mp4" controls width="100%"></video>
+[![▶️ Assistir — Chamadas de Funções Inteligentes (2min)](docs/media/thumb_functions.jpg)](https://github.com/Zeraora-ph/alfred-discord-bot/blob/main/docs/media/alfred_functions.mp4?raw=true)
 
 ### 🎭 Comandos por Voz & Narração Dramática de RPG
 Demonstração do Alfred operando por voz no canal do Discord, interpretando comandos com wake word, aplicando atenuação dinâmica de áudio (Audio Ducking) e gerando uma narração imersiva no modo RPG com efeitos vocais customizados:
 
-<video src="docs/media/demonstracao_rpg.mp4" controls width="100%"></video>
+[![▶️ Assistir — Comandos por Voz e Narração RPG (2:30min)](docs/media/thumb_rpg.jpg)](https://github.com/Zeraora-ph/alfred-discord-bot/blob/main/docs/media/demonstracao_rpg.mp4?raw=true)
 
 ---
 
